@@ -40,6 +40,7 @@ var Configuration  = ConfigurationStruct{} // Needs to be initialized before use
 // Configuration struct used to parse the JSON configuration file.
 type CoreConfig struct {
 	ConfigPath                   string
+	ConfigPathV2				 string
 	GlobalPrefix                 string
 	ConsulProtocol               string
 	ConsulHost                   string

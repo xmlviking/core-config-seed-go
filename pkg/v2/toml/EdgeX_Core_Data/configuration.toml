@@ -1,0 +1,41 @@
+[Service]
+Host = 'localhost'
+CheckInterval = '10s' #Is this used?
+HealthCheck = 'http://localhost:48082/api/v1/ping'
+Port = 48082
+Protocol = 'http'
+ReadMaxLimit = 100
+StartupMsg = 'This is the Core Command Micro Service'
+Timeout = 5000
+
+[Registry]
+Host = 'localhost'
+Port = 8500
+Type = 'consul'
+
+[Logging]
+EnableRemote = false
+File = './logs/edgex-core-command.log'
+RemoteURL = 'http://localhost:48061/api/v1/logs'
+
+[Clients]
+  [Clients.Metadata]
+  Host = 'localhost'
+  Port = 48081
+
+[MetaData]
+ProvisionWatcherURL = 'http://edgex-core-metadata:48081/api/v1/provisionwatcher'
+ProvisionWatcherPath = '/api/v1/provisionwatcher'
+DeviceURL = 'http://edgex-core-metadata:48081/api/v1/device'
+DevicePath = '/api/v1/device'
+CommandURL = 'http://edgex-core-metadata:48081/api/v1/command'
+CommandPath = '/api/v1/command'
+
+[Database]
+Type = "mongo"
+Timeout  = 1000
+Host ="localhost"
+Port = 8100
+Username = "testUserName"
+Password = "testPassword"
+Name = "metadb"

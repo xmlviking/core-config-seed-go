@@ -33,9 +33,9 @@ const (
 
 var confDir = flag.String("confdir", "", "Specify local configuration directory")
 
-func LoadFromFile(profile string, configuration interface{}) error {
+func LoadFromFile(configuration interface{}) error {
 	path := determinePath()
-	fileName := path + "/" + determineConfigFile(profile)
+	fileName := path + "/" + "configuration.toml"
 
 	contents, err := ioutil.ReadFile(fileName)
 	if err != nil {

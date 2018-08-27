@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,10 +29,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/BurntSushi/toml"
-	"github.com/edgexfoundry/core-config-seed-go/pkg"
-	"github.com/edgexfoundry/core-config-seed-go/pkg/config"
+	"github.com/edgexfoundry/core-config-seed-go/internal/pkg"
+	"github.com/edgexfoundry/core-config-seed-go/internal/pkg/config"
+	"github.com/edgexfoundry/core-config-seed-go/pkg/v2/types"
 	"github.com/fatih/structs"
+	"github.com/pelletier/go-toml"
+	"github.com/consulstructure"
 	consulapi "github.com/hashicorp/consul/api"
 	"github.com/magiconair/properties"
 	"gopkg.in/yaml.v2"
@@ -39,7 +42,10 @@ import (
 
 var Version = "master"
 
-const consulStatusPath = "/v1/agent/self"
+const (
+	consulStatusPath = "/v1/agent/self"
+	configDefault    = "configuration.toml"
+)
 
 // Hook the functions in the other packages for the tests.
 var (
@@ -51,6 +57,11 @@ var (
 	httpGet             = http.Get
 )
 
+
+var allowOptions = map[string]string{"name": "", "default": ""}
+
+
+// END Consul parse
 func main() {
 
 	var useConsul bool
@@ -65,7 +76,8 @@ func main() {
 	// Configuration data for the config-seed service.
 	coreConfig := &pkg.CoreConfig{}
 
-	err := config.LoadFromFile(useProfile, coreConfig)
+	// Load based on configuration need (docker or go)
+	err := config.LoadFromFile(coreConfig)
 	if err != nil {
 		logBeforeTermination(err)
 		return
@@ -81,10 +93,12 @@ func main() {
 
 	if coreConfig.IsReset {
 		removeStoredConfig(kv)
-		loadConfigFromPath(*coreConfig, kv)
-	} else if !isConfigInitialized(*coreConfig, kv) {
-		loadConfigFromPath(*coreConfig, kv)
 	}
+	// load V2 config files
+	loadV2ConfigFromPath(useProfile, *coreConfig, kv)
+
+	// load V1 config files
+	loadConfigFromPath(*coreConfig, kv)
 
 	printBanner("./res/banner.txt")
 }
@@ -102,6 +116,21 @@ func printBanner(path string) {
 
 func logBeforeTermination(err error) {
 	fmt.Println(err.Error())
+}
+
+func determineConfigFile(profile string) string {
+	if profile == "" {
+		return configDefault
+	}
+	return "configuration-" + profile + ".toml"
+}
+
+func determineCorrectConfigFile(targetConfig string, fileName string) bool {
+
+	if fileName == targetConfig {
+		return true
+	}
+	return false
 }
 
 // Get handle of Consul client using the URL from configuration info.
@@ -165,12 +194,9 @@ func isConfigInitialized(coreConfig pkg.CoreConfig, kv *consulapi.KV) bool {
 // Load a property file(.yaml or .properties) and parse it to a map.
 func readPropertyFile(coreConfig pkg.CoreConfig, filePath string) (pkg.ConfigProperties, error) {
 
-	// prob should not be here
-	configuration := &pkg.ConfigurationStruct{}
-
 	if isTomlExtension(coreConfig, filePath) {
 		// Read .toml
-		return readTomlFile(filePath, configuration)
+		return readTomlFile(filePath)
 	} else if isYamlExtension(coreConfig, filePath) {
 		// Read .yaml/.yml file
 		return readYamlFile(filePath)
@@ -181,7 +207,110 @@ func readPropertyFile(coreConfig pkg.CoreConfig, filePath string) (pkg.ConfigPro
 
 }
 
-// Load all config files and put the configuration info to Consul K/V store.
+
+// V2 Config changes in parsing and loading.
+// NOTE a simple inline test so you can read the values out after you push them.
+// TODO: change the inline to an external test and run it against the file
+func loadV2ConfigFromPath(profile string, coreConfig pkg.CoreConfig, kv *consulapi.KV) {
+
+	err := filepath.Walk(coreConfig.ConfigPathV2, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip directories & unacceptable property extension
+		if info.IsDir() || !isAcceptablePropertyExtensions(coreConfig, info.Name()) {
+			return nil
+		}
+
+		dir, file := filepath.Split(path)
+		configPath, err := filepath.Rel(".", coreConfig.ConfigPathV2)
+		if err != nil {
+			return err
+		}
+
+		// Use correct configFileName
+		fileName := determineConfigFile(profile)
+
+		// Skip incorrect configs
+		if !determineCorrectConfigFile(fileName, file) {
+			return nil
+		}
+
+		dir = strings.TrimPrefix(dir, configPath+"/")
+		fmt.Println("found config file:", file, "in context", dir)
+
+		// load the ToML file
+		config,_ := toml.LoadFile(path)
+
+		// Fetch the map[string]interface{}
+		m := config.ToMap()
+
+		// traverse the map and put into KV[]
+		kvs, err := traverse("",m)
+		if err != nil {
+			fmt.Printf("There was an error: %v", err)
+		}
+		for _, kv := range kvs {
+			fmt.Println("v2 consul wrote key", kv.Key, "with value", kv.Value)
+		}
+
+		// Put config properties to Consul K/V store.
+		prefix := coreConfig.GlobalPrefix + "/" + dir
+
+		// Put config properties to Consul K/V store.
+		for _,v := range kvs {
+			p := &consulapi.KVPair{Key: prefix + v.Key, Value: []byte(v.Value)}
+			if _, err := consulPut(kv, p, nil); err != nil {
+				return err
+			}
+		}
+
+		// TEST make sure we have our values from Consul
+		// Let's read the values from Consul K/V store now
+		// In our clients we hook this up and we can receive updates from consul changes
+		updateCh := make(chan interface{})
+		errCh := make(chan error)
+		d := &consulstructure.Decoder{
+			Target:   &types.EdgeX_Core_Command{},
+			Prefix:   "config/EdgeX_Core_Command",
+			UpdateCh: updateCh,
+		}
+		defer d.Close()
+		go d.Run()
+
+
+		// NOTE: Place breakpoint here..change the actual loaded values in consul
+		//       They should be pulled via the channel update call and you should see the changes here.
+		//       Look at "actual" value for the map[string]interface{}
+		var raw interface{}
+		select {
+		case <-time.After(1 * time.Second):
+			fmt.Printf("timeout")
+		case err := <-errCh:
+			fmt.Printf("err: %s", err)
+		case raw = <-updateCh:
+		}
+
+		actual := raw.(*types.EdgeX_Core_Command)
+		if actual== nil {
+			fmt.Printf("bad: %#v", actual)
+		}
+
+		// END TEST client read from consul
+
+		return nil
+	})
+
+	// Special case V2 config parsing here
+
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+}
+
+// V1 Config - Load all config files and put the configuration info to Consul K/V store.
 func loadConfigFromPath(coreConfig pkg.CoreConfig, kv *consulapi.KV) {
 	err := filepath.Walk(coreConfig.ConfigPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -210,6 +339,7 @@ func loadConfigFromPath(coreConfig pkg.CoreConfig, kv *consulapi.KV) {
 
 		// Put config properties to Consul K/V store.
 		prefix := coreConfig.GlobalPrefix + "/" + dir
+		// here we need to make sure we add all the keys as appropriate
 		for k := range props {
 			p := &consulapi.KVPair{Key: prefix + k, Value: []byte(props[k])}
 			if _, err := consulPut(kv, p, nil); err != nil {
@@ -218,6 +348,9 @@ func loadConfigFromPath(coreConfig pkg.CoreConfig, kv *consulapi.KV) {
 		}
 		return nil
 	})
+
+	// Special case V2 config parsing here
+
 	if err != nil {
 		fmt.Println(err.Error())
 		return
@@ -252,42 +385,38 @@ func isTomlExtension(coreConfig pkg.CoreConfig, file string) bool {
 	return false
 }
 
-func readTomlFile(filePath string, configuration interface{}) (pkg.ConfigProperties, error) {
-
+//This works for now because our TOML is simply key/value.
+//Will not work once we go hierarchical
+func readTomlFile(filePath string) (pkg.ConfigProperties, error) {
 	configProps := pkg.ConfigProperties{}
 
-	contents, err := ioutil.ReadFile(filePath)
+	file, err := os.Open(filePath)
 	if err != nil {
 		return configProps, fmt.Errorf("could not load configuration file (%s): %v", filePath, err.Error())
 	}
+	defer file.Close()
 
-	// Decode the configuration from TOML
-	err = toml.Unmarshal(contents, configuration)
-	if err != nil {
-		return configProps, fmt.Errorf("unable to parse configuration file (%s): %v", filePath, err.Error())
-	}
+	scanner := bufio.NewScanner(file)
+	scanner.Split(bufio.ScanLines)
 
-	m := structs.Map(configuration)
+	for scanner.Scan() {
+		line := scanner.Text()   // The Line of text were gathering
 
-	form := make(map[string]string)
 
-	for k, v := range m {
-		switch v := v.(type) {
-		case string:
-			form[k] = v
-		case int, int8, int16, int32, int64:
-			iInt := v.(int)
-			iInt, ok := v.(int)
-			if !ok {
-				// issues in cast
-			}
-			form[k] = strconv.Itoa(iInt)
-		case bool:
-			form[k] = strconv.FormatBool(v)
+		if strings.Contains(line, "[") {
+			// Parse the text until the next "]"
+
+
+
 		}
-	}
+		if strings.Contains(line, "=") {
+			tokens := strings.Split(scanner.Text(), "=")
+			configProps[strings.Trim(tokens[0], " '")] = strings.Trim(tokens[1], " '")
+		}
 
-	return form, nil
+
+	}
+	return configProps, nil
 }
 
 // Parse a yaml file to a map.
@@ -326,4 +455,58 @@ func readPropertiesFile(filePath string) (pkg.ConfigProperties, error) {
 	configProps = props.Map()
 
 	return configProps, nil
+}
+
+
+// Key/Value pair for parsing
+type KV struct {
+	Key   string
+	Value string
+}
+
+// Traverse or walk a map with an optional path start
+func traverse(path string, j interface{}) ([]*KV, error) {
+	kvs := make([]*KV, 0)
+
+	pathPre := ""
+	if path != "" {
+		pathPre = path + "/"
+	}
+
+	switch j.(type) {
+	case []interface{}:
+		for sk, sv := range j.([]interface{}) {
+			skvs, err := traverse(pathPre+strconv.Itoa(sk), sv)
+			if err != nil {
+				return nil, err
+			}
+			kvs = append(kvs, skvs...)
+		}
+	case map[string]interface{}:
+		for sk, sv := range j.(map[string]interface{}) {
+			skvs, err := traverse(pathPre+sk, sv)
+			if err != nil {
+				return nil, err
+			}
+			kvs = append(kvs, skvs...)
+		}
+	case int:
+		kvs = append(kvs, &KV{Key: path, Value: strconv.Itoa(j.(int))})
+	case int64:
+
+		var y int = int(j.(int64))
+
+		kvs = append(kvs, &KV{Key: path, Value: strconv.Itoa(y)})
+		//kvs = append(kvs, &KV{Key: path, Value: strconv.FormatInt(j.(int64),64)})
+	case float64:
+		kvs = append(kvs, &KV{Key: path, Value: strconv.FormatFloat(j.(float64), 'f', -1, 64)})
+	case bool:
+		kvs = append(kvs, &KV{Key: path, Value: strconv.FormatBool(j.(bool))})
+	case nil:
+		kvs = append(kvs, &KV{Key: path, Value: ""})
+	default:
+		kvs = append(kvs, &KV{Key: path, Value: j.(string)})
+	}
+
+	return kvs, nil
 }
